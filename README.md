@@ -55,11 +55,12 @@ Query parameters, handy for screenshots:
 | `autoload` | Skip the load button. |
 | `method` | `peel` (depth peeling, the default), `sort` (CPU back-to-front triangle sort), or `wboit` (weighted blended OIT). |
 
-## Known issue
+## Transparency and sampler precision
 
-On some ANGLE-on-NVIDIA configurations the depth-peeling path renders concentric moiré bands at opacity below 100%,
-while the same browser and driver are fine with `?method=sort`. Because the banding survives comparing exact float
-depth copies and rejecting the same triangle by id, plain depth precision does not explain it. Not diagnosed.
+Depth peeling reads the previous layer's depth back from a texture, so that sampler is declared `highp`. In a GLSL ES
+fragment shader `sampler2D` defaults to `lowp` even under `precision highp float`. Most drivers ignore that, but ANGLE
+on NVIDIA (Chrome and Brave on Linux/Wayland with driver 610) honours it and returns depths rounded to fp16. A surface
+then looks behind itself and gets peeled twice, which showed up as concentric moiré bands at opacity below 100%.
 
 ## Generating the data
 

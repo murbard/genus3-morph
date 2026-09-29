@@ -150,11 +150,13 @@ const progOpaque = compile(VS, `#version 300 es
   precision highp float; in vec3 vN; in vec3 vPos; out vec4 o;
   ${SHADE} ${FACE}
   void main() { o = vec4(wire(shade(faceColor(), vN, vPos)), 1.0); }`);
-// depth-peeling pass: keep only fragments strictly behind the previous layer
+// depth-peeling pass: keep only fragments strictly behind the previous layer. The sampler must be highp: sampler2D
+// defaults to lowp in fragment shaders, and ANGLE on NVIDIA honours that, returning the previous depth rounded to fp16,
+// so a surface looks behind itself and is peeled twice (concentric bands at opacity < 1).
 const progPeel = compile(VS, `#version 300 es
   precision highp float; in vec3 vN; in vec3 vPos; flat in float vTri;
   layout(location = 0) out vec4 o; layout(location = 1) out vec4 oz;
-  uniform sampler2D uPrevDepth; uniform int uFirst; uniform float uAlpha; uniform float uEps; uniform int uExact;
+  uniform highp sampler2D uPrevDepth; uniform int uFirst; uniform float uAlpha; uniform float uEps; uniform int uExact;
   ${SHADE} ${FACE}
   void main() {
     // The previous layer's depth is read back from a float colour target holding the exact gl_FragCoord.z this
@@ -406,8 +408,8 @@ const bgColor = () => getComputedStyle(document.body).backgroundColor.match(/\d+
 // ---- alternative transparency methods (selectable with ?method=peel|wboit|sort) ----
 const PARAMS = new URLSearchParams(location.search);
 let TRANSPARENCY = PARAMS.get('method') || 'peel';   // exact per-pixel depth peeling (sorting: ?method=sort)
-// peeling variant: the original depth-texture comparison by default (correct on every GL stack tested but one);
-// ?peelmode=exact uses the float depth copy + triangle id experiment from chasing the banding on that one
+// peeling variant: the depth-texture comparison by default; ?peelmode=exact compares a float depth copy and
+// rejects the previous layer's triangle by id
 const PEEL_EXACT = PARAMS.get('peelmode') === 'exact';
 function drawPeel(MV, Pm, bg, w, h) {
   if (!peel || peel.w !== w || peel.h !== h) peel = makePeelTargets(w, h);
@@ -463,7 +465,7 @@ const progWbAccum = compile(VS, `#version 300 es
 const progWbResolve = compile(`#version 300 es
   const vec2 P[3] = vec2[3](vec2(-1,-1), vec2(3,-1), vec2(-1,3));
   void main() { gl_Position = vec4(P[gl_VertexID], 0, 1); }`, `#version 300 es
-  precision highp float; uniform sampler2D uAcc; uniform sampler2D uRev; out vec4 o;
+  precision highp float; uniform highp sampler2D uAcc; uniform highp sampler2D uRev; out vec4 o;
   void main() {
     vec4 acc = texelFetch(uAcc, ivec2(gl_FragCoord.xy), 0); float rev = texelFetch(uRev, ivec2(gl_FragCoord.xy), 0).r;
     o = vec4(acc.rgb / max(acc.a, 1e-5), 1.0 - rev);     // blended over the background with (SRC_ALPHA, 1 - SRC_ALPHA)
