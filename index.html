@@ -1,0 +1,678 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Genus-3 Morph</title>
+<style>
+  :root { --bg: #f4f3ef; --fg: #222; --muted: #666; --panel: rgba(255,255,255,0.75); }
+  @media (prefers-color-scheme: dark) { :root { --bg: #16171a; --fg: #e8e8e8; --muted: #999; --panel: rgba(30,31,35,0.8); } }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+    font: 14px/1.4 system-ui, sans-serif; overflow: hidden; }
+  canvas { background: var(--bg); display: block; width: 100vw; height: 100vh; cursor: grab; touch-action: none; }
+  canvas.drag { cursor: grabbing; }
+  #info { position: absolute; top: 12px; left: 16px; right: 16px; pointer-events: none; }
+  #info h1 { font-size: 16px; margin: 0 0 2px; }
+  #info p { margin: 0; color: var(--muted); font-size: 12px; max-width: 60em; }
+  #controls { position: absolute; left: 16px; right: 16px; bottom: 12px; display: flex; flex-direction: column; gap: 8px; }
+  #timeline { display: flex; align-items: center; gap: 10px; background: var(--panel); padding: 6px 10px; border-radius: 8px; }
+  #timeline input[type=range] { flex: 1; min-width: 0; }
+  #timeline button { font: inherit; padding: 2px 10px; border-radius: 6px; border: 1px solid var(--muted); background: transparent; color: var(--fg); cursor: pointer; min-width: 4.5em; }
+  #stage { font-size: 12px; color: var(--muted); min-width: 11em; text-align: right; font-variant-numeric: tabular-nums; }
+  #row2 { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
+  #legend { display: flex; gap: 10px; flex-wrap: wrap; }
+  #legend label, #opts label { display: flex; align-items: center; gap: 4px; font-size: 12px; cursor: pointer; user-select: none; }
+  #allFaces { font: inherit; font-size: 11px; padding: 1px 8px; border-radius: 5px; border: 1px solid var(--muted);
+    background: transparent; color: var(--fg); cursor: pointer; }
+  #legend span { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+  #opts { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+  #opts output { width: 3em; font-variant-numeric: tabular-nums; font-size: 12px; }
+  #loading { position: absolute; inset: 0; display: flex; flex-direction: column; gap: 10px; align-items: center; justify-content: center; color: var(--muted); pointer-events: none; font-size: 13px; }
+  #loadBtn { pointer-events: auto; font: inherit; font-size: 15px; padding: 10px 22px; border-radius: 8px; cursor: pointer;
+    border: 1px solid var(--muted); background: var(--panel); color: var(--fg); }
+  #loadBtn:hover { border-color: var(--fg); }
+  #loading .bar { width: min(320px, 70vw); height: 6px; border-radius: 3px; background: color-mix(in srgb, var(--muted) 25%, transparent); overflow: hidden; }
+  #loading .fill { height: 100%; width: 0%; background: #4363d8; transition: width 0.15s linear; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="info">
+  <h1>From the genus-3 octahedron to a smooth triple torus</h1>
+  <p>Drag to rotate, scroll to zoom. Each triangle keeps the color of the polyhedron face it started on.</p>
+</div>
+<div id="loading"><button id="loadBtn">Load animation</button><div id="loadText" hidden>Loading…</div><div class="bar" hidden><div class="fill" id="loadFill"></div></div></div>
+<div id="controls">
+  <div id="timeline">
+    <button id="play">Play</button>
+    <input id="time" type="range" min="0" max="1000" step="1" value="0" aria-label="Animation time">
+    <div id="stage"></div>
+  </div>
+  <div id="row2">
+    <div id="legend"></div>
+    <div id="opts">
+      <label><input id="mesh" type="checkbox"> Triangle mesh</label>
+      <label>Speed <input id="speed" type="range" min="0.25" max="4" step="0.25" value="1"></label>
+      <label>Opacity <input id="opacity" type="range" min="0.1" max="1" step="0.05" value="1"><output id="opOut">100%</output></label>
+    </div>
+  </div>
+</div>
+<script src="morph_loader.js"></script>
+<script>
+const FACE_VISIBLE = [true, true, true, true, true, true, true, true];   // shared by the checkboxes and the renderer
+const COLORS = ['#e6194b','#3cb44b','#ffe119','#4363d8','#f58231','#911eb4','#42d4f4','#f032e6'];
+const hex = h => [1,3,5].map(i => parseInt(h.slice(i, i+2), 16) / 255);
+
+async function gunzip(b64) {
+  const bin = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  const stream = new Blob([bin]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+// The animation is a sequence of epochs; each has its own triangulation (the mesh is remeshed between epochs).
+// Consecutive epochs share their boundary instant, where both describe the same surface.
+// progress: downloading is the first 80% of the bar, unpacking (replaying the remesh rounds) the last 20%
+function setProgress(frac, text) {
+  const f = document.getElementById('loadFill'), t = document.getElementById('loadText');
+  if (f) f.style.width = (100 * Math.max(0, Math.min(1, frac))).toFixed(1) + '%';
+  if (t && text) t.textContent = text;
+}
+async function loadData() {
+  const r = await fetch('morph.bin');
+  if (!r.ok) throw new Error('could not load morph.bin (' + r.status + ')');
+  const total = +r.headers.get('Content-Length') || 0, parts = []; let got = 0;
+  const reader = r.body.getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    parts.push(value); got += value.length;
+    const mb = (got / 1e6).toFixed(1);
+    setProgress(total ? 0.8 * got / total : 0.4, total ? `Downloading… ${mb} / ${(total / 1e6).toFixed(1)} MB` : `Downloading… ${mb} MB`);
+  }
+  const buf = new Uint8Array(got); let o = 0;
+  for (const p of parts) { buf.set(p, o); o += p.length; }
+  setProgress(0.8, 'Unpacking…');
+  return parseMorph(buf.buffer, (k, n) => setProgress(0.8 + 0.2 * k / n, `Unpacking… ${k} / ${n}`));
+}
+function epochAt(t) {
+  const E = mesh.epochs; let k = 0;
+  while (k + 1 < E.length && E[k + 1].start <= t) k++;
+  return k;
+}
+
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2', { antialias: true, alpha: false });
+const EXACT_DEPTH = !!(gl && gl.getExtension('EXT_color_buffer_float'));
+
+function compile(vs, fs) {
+  const mk = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; };
+  const p = gl.createProgram(); gl.attachShader(p, mk(gl.VERTEX_SHADER, vs)); gl.attachShader(p, mk(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p); if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p)); return p;
+}
+
+const VS = `#version 300 es
+  in vec3 aPos; in vec3 aNrm; in vec4 aW0; in vec4 aW1; in float aLab; in vec3 aBary;
+  uniform mat4 uMV, uP;
+  invariant gl_Position;                       // identical depth in every pass (depth peeling)
+  out vec3 vN; out vec3 vPos; out vec4 vW0; out vec4 vW1; flat out int vLab; out vec3 vBary; flat out float vTri;
+  void main() { vec4 p = uMV * vec4(aPos, 1.0); vPos = p.xyz; vN = mat3(uMV) * aNrm;
+    vW0 = aW0; vW1 = aW1; vLab = int(aLab + 0.5); vBary = aBary; vTri = float(gl_VertexID / 3); gl_Position = uP * p; }`;
+// Face colour per fragment: blend the triangle's own label (exact seams) with smoothed per-vertex face memberships
+// (smooth seams), then take the strongest face.
+const FACE = `
+  in vec4 vW0; in vec4 vW1; flat in int vLab; in vec3 vBary;
+  uniform float uSeam; uniform vec3 uPal[8]; uniform float uVis[8]; uniform float uWire;
+  // triangle-mesh overlay: darken within ~1 pixel of a triangle edge
+  vec3 wire(vec3 c) {
+    if (uWire < 0.5) return c;
+    vec3 d = fwidth(vBary); vec3 a = smoothstep(vec3(0.0), d * 1.2, vBary);
+    return mix(c * 0.25, c, min(min(a.x, a.y), a.z));
+  }
+  vec3 faceColor() {
+    float w[8] = float[8](vW0.x, vW0.y, vW0.z, vW0.w, vW1.x, vW1.y, vW1.z, vW1.w);
+    int best = 0; float bv = -1.0;
+    for (int i = 0; i < 8; i++) { float v = mix(i == vLab ? 1.0 : 0.0, w[i], uSeam); if (v > bv) { bv = v; best = i; } }
+    if (uVis[best] < 0.5) discard;
+    return uPal[best];
+  }`;
+const SHADE = `
+  vec3 shade(vec3 base, vec3 N, vec3 P) {
+    vec3 n = normalize(N); if (!gl_FrontFacing) n = -n;
+    vec3 V = normalize(-P);
+    vec3 L1 = normalize(vec3(0.5, 0.8, 1.0)), L2 = normalize(vec3(-0.7, -0.3, 0.4));
+    float d = max(dot(n, L1), 0.0) * 0.75 + max(dot(n, L2), 0.0) * 0.25;
+    float s = pow(max(dot(n, normalize(L1 + V)), 0.0), 40.0) * 0.3;
+    return pow(base * (0.28 + d) + vec3(s), vec3(1.0/1.1));
+  }`;
+// opaque pass
+const progOpaque = compile(VS, `#version 300 es
+  precision highp float; in vec3 vN; in vec3 vPos; out vec4 o;
+  ${SHADE} ${FACE}
+  void main() { o = vec4(wire(shade(faceColor(), vN, vPos)), 1.0); }`);
+// depth-peeling pass: keep only fragments strictly behind the previous layer
+const progPeel = compile(VS, `#version 300 es
+  precision highp float; in vec3 vN; in vec3 vPos; flat in float vTri;
+  layout(location = 0) out vec4 o; layout(location = 1) out vec4 oz;
+  uniform sampler2D uPrevDepth; uniform int uFirst; uniform float uAlpha; uniform float uEps; uniform int uExact;
+  ${SHADE} ${FACE}
+  void main() {
+    // The previous layer's depth is read back from a float colour target holding the exact gl_FragCoord.z this
+    // shader computed, so a surface is never mistaken for being behind itself, whatever the depth buffer's precision.
+    if (uFirst == 0) {
+      vec4 prev = texelFetch(uPrevDepth, ivec2(gl_FragCoord.xy), 0);
+      if (uExact == 1) {
+        // exact path: the previous layer stored (depth, triangle id). The same triangle can never be the next layer
+        // at this pixel, whatever tiny depth differences a driver introduces between passes.
+        if (vTri == prev.g || gl_FragCoord.z < prev.r) discard;
+      } else if (gl_FragCoord.z <= prev.r + uEps) discard;
+    }
+    o = vec4(wire(shade(faceColor(), vN, vPos)) * uAlpha, uAlpha);   // premultiplied
+    oz = vec4(gl_FragCoord.z, vTri, 0.0, 1.0);
+  }`);
+// full-screen composite (front-to-back "under" blending of one layer into the accumulator)
+const progQuad = compile(`#version 300 es
+  const vec2 P[3] = vec2[3](vec2(-1,-1), vec2(3,-1), vec2(-1,3));
+  void main() { gl_Position = vec4(P[gl_VertexID], 0, 1); }`, `#version 300 es
+  precision highp float; uniform sampler2D uTex; out vec4 o;
+  void main() { o = texelFetch(uTex, ivec2(gl_FragCoord.xy), 0); }`);
+
+let mesh = null, geo = null;
+const view = { rot: null, dist: 3.0 };
+
+function mul(a, b) { const r = new Float32Array(16);
+  for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) { let s = 0; for (let k = 0; k < 4; k++) s += a[k*4+j] * b[i*4+k]; r[i*4+j] = s; }
+  return r; }
+function perspective(fovy, aspect, near, far) { const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+  return new Float32Array([f/aspect,0,0,0, 0,f,0,0, 0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0]); }
+function axisAngle(ax, ang) { const l = Math.hypot(...ax), [x, y, z] = ax.map(v => v / l), c = Math.cos(ang), s = Math.sin(ang), t = 1 - c;
+  return new Float32Array([t*x*x+c, t*x*y+s*z, t*x*z-s*y, 0, t*x*y-s*z, t*y*y+c, t*y*z+s*x, 0, t*x*z+s*y, t*y*z-s*x, t*z*z+c, 0, 0,0,0,1]); }
+// Float32 rotations accumulate drift, so pull the 3x3 block back onto SO(3) now and then:
+// Gram-Schmidt the first two columns (column i of this layout lives at i*4), then cross them for the third,
+// which also pins the determinant at +1 rather than letting a reflection creep in.
+function orthonormalize(m) {
+  const norm = v => { const l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0]/l, v[1]/l, v[2]/l]; };
+  const x = norm([m[0], m[1], m[2]]);
+  const y0 = [m[4], m[5], m[6]], d = x[0]*y0[0] + x[1]*y0[1] + x[2]*y0[2];
+  const y = norm([y0[0] - d*x[0], y0[1] - d*x[1], y0[2] - d*x[2]]);
+  const z = [x[1]*y[2] - x[2]*y[1], x[2]*y[0] - x[0]*y[2], x[0]*y[1] - x[1]*y[0]];
+  [x, y, z].forEach((c, i) => { m[i*4] = c[0]; m[i*4+1] = c[1]; m[i*4+2] = c[2]; });
+  return m; }
+view.rot = mul(axisAngle([1,0,0], -1.1), axisAngle([0,0,1], 0.5));
+
+// ---- geometry: triangles expanded so each keeps its face color; positions/normals updated per frame ----
+function buildGeometry(m) {
+  const nt = Math.max(...m.epochs.map(e => e.F.length / 3)), nvMax = Math.max(...m.epochs.map(e => e.nv));
+  const pos = new Float32Array(nt * 9), nrm = new Float32Array(nt * 9);
+  const w0 = new Float32Array(nt * 12), w1 = new Float32Array(nt * 12), lab = new Float32Array(nt * 3);
+  const bary = new Float32Array(nt * 9);
+  for (let t = 0; t < nt; t++) { bary[9 * t] = 1; bary[9 * t + 4] = 1; bary[9 * t + 8] = 1; }
+  const mk = (data, usage) => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, data, usage); return b; };
+  const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+  const bPos = mk(pos, gl.DYNAMIC_DRAW), bNrm = mk(nrm, gl.DYNAMIC_DRAW);
+  const bW0 = mk(w0, gl.DYNAMIC_DRAW), bW1 = mk(w1, gl.DYNAMIC_DRAW), bLab = mk(lab, gl.DYNAMIC_DRAW), bBary = mk(bary, gl.STATIC_DRAW);
+  for (const p of [progOpaque, progPeel]) {
+    for (const [name, b, n] of [['aPos', bPos, 3], ['aNrm', bNrm, 3], ['aW0', bW0, 4], ['aW1', bW1, 4], ['aLab', bLab, 1], ['aBary', bBary, 3]]) {
+      const loc = gl.getAttribLocation(p, name); if (loc < 0) continue;
+      gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, n, gl.FLOAT, false, 0, 0);
+    }
+  }
+  return { vao, bPos, bNrm, bW0, bW1, bLab, pos, nrm, w0, w1, lab, cur: new Float32Array(nvMax * 3), vn: new Float32Array(nvMax * 3), nt,
+           visible: FACE_VISIBLE, count: 0, epochKey: -1 };
+}
+
+// ---- smooth seams ----
+// Seams between faces are chains of mesh edges running from junction to junction (vertices where >= 3 faces meet).
+// For display each chain is smoothed as a curve on the surface (junctions fixed), and every vertex near a seam gets a
+// signed distance to the smoothed curves, positive toward its own face. The fragment shader colours by the largest
+// value, so boundaries follow the smooth curves across triangles. Only the colouring changes, never the geometry.
+const SEAM_R = 20, SEAM_SMOOTH = 30, SEAM_RINGS = 3, SEAM_CLAMP = 0.35;
+function seamTopo(m) {
+  if (m.seams) return m.seams;
+  const F = m.F, L = m.L, nv = m.nv, nt = F.length / 3;
+  const nb = Array.from({ length: nv }, () => new Set()), vlabs = Array.from({ length: nv }, () => new Set());
+  const dir = new Map();                                  // directed edge "u,w" -> triangle containing it (CCW)
+  for (let t = 0; t < nt; t++) for (let j = 0; j < 3; j++) {
+    const a = F[3 * t + j], b = F[3 * t + (j + 1) % 3];
+    nb[a].add(b); nb[b].add(a); vlabs[a].add(L[t]); dir.set(a + ',' + b, t);
+  }
+  const seamNb = Array.from({ length: nv }, () => []);
+  for (const [key, t] of dir) {
+    const [a, b] = key.split(',').map(Number); if (a > b) continue;
+    const t2 = dir.get(b + ',' + a); if (t2 === undefined || L[t] === L[t2]) continue;
+    seamNb[a].push(b); seamNb[b].push(a);
+  }
+  const isJ = v => vlabs[v].size >= 3 || (seamNb[v].length > 0 && seamNb[v].length !== 2);
+  const used = new Set(), chains = [];
+  const walk = (v0, v1) => {
+    const c = [v0, v1]; used.add(Math.min(v0, v1) + ',' + Math.max(v0, v1));
+    while (!isJ(c[c.length - 1]) && c[c.length - 1] !== c[0]) {
+      const v = c[c.length - 1], p = c[c.length - 2], nx = seamNb[v].find(u => u !== p);
+      if (nx === undefined) break;
+      const k = Math.min(v, nx) + ',' + Math.max(v, nx); if (used.has(k)) break; used.add(k); c.push(nx);
+    }
+    const t = dir.get(c[0] + ',' + c[1]), t2 = dir.get(c[1] + ',' + c[0]);
+    chains.push({ v: c, left: L[t], right: L[t2] });      // 'left' face lies on the n x tangent side
+  };
+  for (let v = 0; v < nv; v++) if (isJ(v)) for (const u of seamNb[v]) if (!used.has(Math.min(v, u) + ',' + Math.max(v, u))) walk(v, u);
+  for (let v = 0; v < nv; v++) for (const u of seamNb[v]) if (!used.has(Math.min(v, u) + ',' + Math.max(v, u))) walk(v, u);   // closed loops
+  // vertices near seams, with the chains around them
+  const near = new Map();
+  chains.forEach((c, ci) => { for (const v of c.v) { if (!near.has(v)) near.set(v, new Set()); near.get(v).add(ci); } });
+  let frontier = Array.from(near.keys());
+  for (let r = 0; r < SEAM_RINGS; r++) {
+    const next = [];
+    for (const v of frontier) for (const u of nb[v]) {
+      if (!near.has(u)) { near.set(u, new Set()); next.push(u); }
+      for (const ci of near.get(v)) near.get(u).add(ci);
+    }
+    frontier = next;
+  }
+  const own = new Int32Array(nv); for (let t = 0; t < nt; t++) for (let j = 0; j < 3; j++) own[F[3 * t + j]] = L[t];
+  return (m.seams = { chains, near, own });
+}
+function seamField(m, fi) {                // per keyframe, cached
+  m.fieldCache = m.fieldCache || new Map();
+  if (m.fieldCache.has(fi)) return m.fieldCache.get(fi);
+  const S = seamTopo(m), nv = m.nv, X = m.frames.subarray(fi * nv * 3, (fi + 1) * nv * 3), F = m.F;
+  const N = new Float32Array(nv * 3);
+  for (let t3 = 0; t3 < F.length; t3 += 3) {
+    const i0 = F[t3] * 3, i1 = F[t3 + 1] * 3, i2 = F[t3 + 2] * 3;
+    const ux = X[i1] - X[i0], uy = X[i1 + 1] - X[i0 + 1], uz = X[i1 + 2] - X[i0 + 2], vx = X[i2] - X[i0], vy = X[i2 + 1] - X[i0 + 1], vz = X[i2 + 2] - X[i0 + 2];
+    const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+    for (const j of [i0, i1, i2]) { N[j] += nx; N[j + 1] += ny; N[j + 2] += nz; }
+  }
+  for (let v = 0; v < nv; v++) { const l = Math.hypot(N[3 * v], N[3 * v + 1], N[3 * v + 2]) || 1; N[3 * v] /= l; N[3 * v + 1] /= l; N[3 * v + 2] /= l; }
+  // smooth every chain on the surface (endpoints fixed unless the chain is a closed loop)
+  const curves = S.chains.map(c => {
+    const n = c.v.length, loop = c.v[0] === c.v[n - 1], P = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) for (let k = 0; k < 3; k++) P[3 * i + k] = X[3 * c.v[i] + k];
+    for (let it = 0; it < SEAM_SMOOTH; it++) for (let i = 1; i < n - 1; i++) {
+      const v = c.v[i];
+      for (let k = 0; k < 3; k++) P[3 * i + k] += 0.5 * (0.5 * (P[3 * (i - 1) + k] + P[3 * (i + 1) + k]) - P[3 * i + k]);
+      const d = (P[3 * i] - X[3 * v]) * N[3 * v] + (P[3 * i + 1] - X[3 * v + 1]) * N[3 * v + 1] + (P[3 * i + 2] - X[3 * v + 2]) * N[3 * v + 2];
+      for (let k = 0; k < 3; k++) P[3 * i + k] -= d * N[3 * v + k];
+      // stay within a third of an edge of the original seam vertex, so the two sides of a thin strip never cross
+      const lim = SEAM_CLAMP * Math.hypot(X[3 * c.v[i + 1]] - X[3 * v], X[3 * c.v[i + 1] + 1] - X[3 * v + 1], X[3 * c.v[i + 1] + 2] - X[3 * v + 2]);
+      const ox = P[3 * i] - X[3 * v], oy = P[3 * i + 1] - X[3 * v + 1], oz = P[3 * i + 2] - X[3 * v + 2], ol = Math.hypot(ox, oy, oz);
+      if (ol > lim) { const f = lim / ol; P[3 * i] = X[3 * v] + ox * f; P[3 * i + 1] = X[3 * v + 1] + oy * f; P[3 * i + 2] = X[3 * v + 2] + oz * f; }
+    }
+    return P;
+  });
+  const W = new Float32Array(nv * 8);
+  for (let v = 0; v < nv; v++) { for (let r = 0; r < 8; r++) W[8 * v + r] = -SEAM_R; W[8 * v + S.own[v]] = SEAM_R; }
+  for (const [v, cs] of S.near) {
+    // nearest point on any smoothed seam: its side decides the face (+distance), the face across it gets -distance
+    const px = X[3 * v], py = X[3 * v + 1], pz = X[3 * v + 2], nx = N[3 * v], ny = N[3 * v + 1], nz = N[3 * v + 2];
+    let best = Infinity, side = 1, bc = -1;
+    for (const ci of cs) {
+      const P = curves[ci], n = P.length / 3;
+      for (let i = 0; i + 1 < n; i++) {
+        const ax = P[3 * i], ay = P[3 * i + 1], az = P[3 * i + 2], tx = P[3 * i + 3] - ax, ty = P[3 * i + 4] - ay, tz = P[3 * i + 5] - az;
+        const tt = tx * tx + ty * ty + tz * tz || 1e-12, s = Math.max(0, Math.min(1, ((px - ax) * tx + (py - ay) * ty + (pz - az) * tz) / tt));
+        const qx = px - ax - s * tx, qy = py - ay - s * ty, qz = pz - az - s * tz, d = Math.hypot(qx, qy, qz);
+        if (d < best) { best = d; bc = ci; side = Math.sign(qx * (ny * tz - nz * ty) + qy * (nz * tx - nx * tz) + qz * (nx * ty - ny * tx)) || 1; }
+      }
+    }
+    if (bc < 0) continue;
+    const c = S.chains[bc], mine = side > 0 ? c.left : c.right, other = side > 0 ? c.right : c.left, d = Math.min(best, SEAM_R);
+    for (let r = 0; r < 8; r++) W[8 * v + r] = -SEAM_R;
+    W[8 * v + mine] = d; W[8 * v + other] = -d;
+  }
+  for (let q = 0; q < W.length; q++) W[q] = 0.5 + 0.5 * W[q] / SEAM_R;
+  if (m.fieldCache.size > 6) m.fieldCache.delete(m.fieldCache.keys().next().value);
+  m.fieldCache.set(fi, W);
+  return W;
+}
+
+function setFrame(t) {           // t in [0, nf-1]; linear interpolation between keyframes of the current epoch
+  const k = epochAt(t), m = mesh.epochs[k], g = geo, n3 = m.nv * 3;
+  const lt = Math.min(t - m.start, m.nf - 1);
+  const i = Math.max(0, Math.min(Math.floor(lt), m.nf - 2)), a = m.nf > 1 ? lt - i : 0, o0 = i * n3, o1 = Math.min(i + 1, m.nf - 1) * n3;
+  for (let q = 0; q < n3; q++) g.cur[q] = m.frames[o0 + q] * (1 - a) + m.frames[o1 + q] * a;
+  const X = g.cur, F = m.F, vn = g.vn; vn.fill(0, 0, n3);
+  for (let t3 = 0; t3 < F.length; t3 += 3) {
+    const i0 = F[t3]*3, i1 = F[t3+1]*3, i2 = F[t3+2]*3;
+    const ux = X[i1]-X[i0], uy = X[i1+1]-X[i0+1], uz = X[i1+2]-X[i0+2], vx = X[i2]-X[i0], vy = X[i2+1]-X[i0+1], vz = X[i2+2]-X[i0+2];
+    const nx = uy*vz-uz*vy, ny = uz*vx-ux*vz, nz = ux*vy-uy*vx;
+    for (const j of [i0, i1, i2]) { vn[j] += nx; vn[j+1] += ny; vn[j+2] += nz; }
+  }
+  // the polyhedron's faces are flat: near t=0 use face normals so the start looks exactly faceted
+  const flat = Math.max(0, 1 - t / 3);
+  // raw per-triangle labels (static within an epoch)
+  if (g.epochKey !== k) {
+    for (let t3 = 0; t3 < F.length; t3 += 3) for (let j = 0; j < 3; j++) g.lab[t3 + j] = m.L[t3 / 3];
+    gl.bindBuffer(gl.ARRAY_BUFFER, g.bLab); gl.bufferSubData(gl.ARRAY_BUFFER, 0, g.lab, 0, F.length);
+    g.epochKey = k;
+  }
+  // smooth-seam field, interpolated between the two keyframes (only for data without geometric seams)
+  if (false) {   // (per-pixel seam field disabled)
+    const i1 = Math.min(i + 1, m.nf - 1), WA = seamField(m, i), WB = seamField(m, i1);
+    for (let t3 = 0; t3 < F.length; t3 += 3) for (let j = 0; j < 3; j++) {
+      const v = F[t3 + j], o = t3 + j;
+      for (let c = 0; c < 4; c++) {
+        g.w0[o * 4 + c] = WA[v * 8 + c] * (1 - a) + WB[v * 8 + c] * a;
+        g.w1[o * 4 + c] = WA[v * 8 + 4 + c] * (1 - a) + WB[v * 8 + 4 + c] * a;
+      }
+    }
+    const n = F.length;
+    gl.bindBuffer(gl.ARRAY_BUFFER, g.bW0); gl.bufferSubData(gl.ARRAY_BUFFER, 0, g.w0, 0, n * 4);
+    gl.bindBuffer(gl.ARRAY_BUFFER, g.bW1); gl.bufferSubData(gl.ARRAY_BUFFER, 0, g.w1, 0, n * 4);
+  }
+  let w = 0;
+  for (let t3 = 0; t3 < F.length; t3 += 3) {
+    const i0 = F[t3]*3, i1 = F[t3+1]*3, i2 = F[t3+2]*3;
+    const ux = X[i1]-X[i0], uy = X[i1+1]-X[i0+1], uz = X[i1+2]-X[i0+2], vx = X[i2]-X[i0], vy = X[i2+1]-X[i0+1], vz = X[i2+2]-X[i0+2];
+    let fx = uy*vz-uz*vy, fy = uz*vx-ux*vz, fz = ux*vy-uy*vx; const fl = Math.hypot(fx, fy, fz) || 1; fx /= fl; fy /= fl; fz /= fl;
+    for (const j of [i0, i1, i2]) {
+      const l = Math.hypot(vn[j], vn[j+1], vn[j+2]) || 1;
+      g.pos[w] = X[j]; g.pos[w+1] = X[j+1]; g.pos[w+2] = X[j+2];
+      g.nrm[w] = flat * fx + (1 - flat) * vn[j] / l; g.nrm[w+1] = flat * fy + (1 - flat) * vn[j+1] / l; g.nrm[w+2] = flat * fz + (1 - flat) * vn[j+2] / l;
+      w += 3;
+    }
+  }
+  g.count = w / 3;
+  gl.bindBuffer(gl.ARRAY_BUFFER, g.bPos); gl.bufferSubData(gl.ARRAY_BUFFER, 0, g.pos, 0, w);
+  gl.bindBuffer(gl.ARRAY_BUFFER, g.bNrm); gl.bufferSubData(gl.ARRAY_BUFFER, 0, g.nrm, 0, w);
+}
+
+// ---- depth peeling targets ----
+let peel = null;
+function makePeelTargets(w, h) {
+  const tex = (internal, format, type) => { const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, h, 0, format, type, null);
+    for (const p of [gl.TEXTURE_MIN_FILTER, gl.TEXTURE_MAG_FILTER]) gl.texParameteri(gl.TEXTURE_2D, p, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE); return t; };
+  const P = { w, h, depth: [0, 1].map(() => tex(gl.DEPTH_COMPONENT32F, gl.DEPTH_COMPONENT, gl.FLOAT)),
+    color: tex(gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE), accum: tex(gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE) };
+  // exact depth copies (float colour targets) when the browser can render to float textures
+  P.exact = EXACT_DEPTH && PEEL_EXACT;
+  P.zcopy = P.exact ? [0, 1].map(() => tex(gl.RG32F, gl.RG, gl.FLOAT)) : null;
+  P.fbLayer = [0, 1].map(i => { const fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, P.color, 0);
+    if (P.exact) gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, P.zcopy[i], 0);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, P.depth[i], 0);
+    gl.drawBuffers(P.exact ? [gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1] : [gl.COLOR_ATTACHMENT0]);
+    return fb; });
+  P.fbAccum = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, P.fbAccum);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, P.accum, 0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return P;
+}
+
+let opacity = 1, playing = false, t = 0, speed = 1, lastT = performance.now();
+const bgColor = () => getComputedStyle(document.body).backgroundColor.match(/\d+/g).map(x => x / 255);
+
+// ---- alternative transparency methods (selectable with ?method=peel|wboit|sort) ----
+const PARAMS = new URLSearchParams(location.search);
+let TRANSPARENCY = PARAMS.get('method') || 'peel';   // exact per-pixel depth peeling (sorting: ?method=sort)
+// peeling variant: the original depth-texture comparison by default (correct on every GL stack tested but one);
+// ?peelmode=exact uses the float depth copy + triangle id experiment from chasing the banding on that one
+const PEEL_EXACT = PARAMS.get('peelmode') === 'exact';
+function drawPeel(MV, Pm, bg, w, h) {
+  if (!peel || peel.w !== w || peel.h !== h) peel = makePeelTargets(w, h);
+  gl.viewport(0, 0, w, h);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, peel.fbAccum); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.useProgram(progPeel);
+  gl.uniformMatrix4fv(gl.getUniformLocation(progPeel, 'uMV'), false, MV); setFaceUniforms(progPeel);
+  gl.uniformMatrix4fv(gl.getUniformLocation(progPeel, 'uP'), false, Pm);
+  gl.uniform1f(gl.getUniformLocation(progPeel, 'uAlpha'), opacity);
+  for (let layer = 0; layer < 10; layer++) {
+    const cur = layer % 2, prev = 1 - cur;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, peel.fbLayer[cur]);
+    gl.clearBufferfv(gl.COLOR, 0, [0, 0, 0, 0]);
+    if (peel.exact) gl.clearBufferfv(gl.COLOR, 1, [1, -1, 0, 0]);
+    gl.clearDepth(1); gl.clear(gl.DEPTH_BUFFER_BIT);
+    gl.disable(gl.BLEND); gl.enable(gl.DEPTH_TEST); gl.depthMask(true);
+    gl.useProgram(progPeel);
+    gl.uniform1i(gl.getUniformLocation(progPeel, 'uFirst'), layer === 0 ? 1 : 0);
+    gl.uniform1f(gl.getUniformLocation(progPeel, 'uEps'), PARAMS.has('eps') ? +PARAMS.get('eps') : 0.0);
+    gl.uniform1i(gl.getUniformLocation(progPeel, 'uExact'), peel.exact ? 1 : 0);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, peel.exact ? peel.zcopy[prev] : peel.depth[prev]);
+    gl.uniform1i(gl.getUniformLocation(progPeel, 'uPrevDepth'), 0);
+    gl.bindVertexArray(geo.vao);
+    gl.drawArrays(gl.TRIANGLES, 0, geo.count);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, peel.fbAccum);
+    gl.disable(gl.DEPTH_TEST); gl.enable(gl.BLEND);
+    gl.blendFuncSeparate(gl.ONE_MINUS_DST_ALPHA, gl.ONE, gl.ONE_MINUS_DST_ALPHA, gl.ONE);
+    gl.useProgram(progQuad);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, peel.color);
+    gl.uniform1i(gl.getUniformLocation(progQuad, 'uTex'), 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.clearColor(bg[0], bg[1], bg[2], 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  gl.useProgram(progQuad);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, peel.accum);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.disable(gl.BLEND); gl.enable(gl.DEPTH_TEST);
+}
+// weighted blended order-independent transparency (McGuire & Bavoil 2013): no ordering, no depth comparisons
+let wb = null;
+const progWbAccum = compile(VS, `#version 300 es
+  precision highp float; in vec3 vN; in vec3 vPos; out vec4 o;
+  uniform float uAlpha; uniform int uPass;
+  ${SHADE} ${FACE}
+  void main() {
+    vec3 c = wire(shade(faceColor(), vN, vPos));
+    float a = uAlpha, z = gl_FragCoord.z;
+    float wgt = a * clamp(3e3 * pow(1.0 - z, 3.0), 1e-2, 3e3);
+    o = uPass == 0 ? vec4(c * a, a) * wgt : vec4(a);
+  }`);
+const progWbResolve = compile(`#version 300 es
+  const vec2 P[3] = vec2[3](vec2(-1,-1), vec2(3,-1), vec2(-1,3));
+  void main() { gl_Position = vec4(P[gl_VertexID], 0, 1); }`, `#version 300 es
+  precision highp float; uniform sampler2D uAcc; uniform sampler2D uRev; out vec4 o;
+  void main() {
+    vec4 acc = texelFetch(uAcc, ivec2(gl_FragCoord.xy), 0); float rev = texelFetch(uRev, ivec2(gl_FragCoord.xy), 0).r;
+    o = vec4(acc.rgb / max(acc.a, 1e-5), 1.0 - rev);     // blended over the background with (SRC_ALPHA, 1 - SRC_ALPHA)
+  }`);
+function drawWboit(MV, Pm, bg, w, h) {
+  if (!wb || wb.w !== w || wb.h !== h) {
+    gl.getExtension('EXT_color_buffer_float'); gl.getExtension('EXT_float_blend');
+    const tex = (internal, format, type) => { const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+      gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, h, 0, format, type, null);
+      for (const p of [gl.TEXTURE_MIN_FILTER, gl.TEXTURE_MAG_FILTER]) gl.texParameteri(gl.TEXTURE_2D, p, gl.NEAREST); return t; };
+    wb = { w, h, acc: tex(gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT), rev: tex(gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT) };
+    wb.fbA = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, wb.fbA); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, wb.acc, 0);
+    wb.fbR = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, wb.fbR); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, wb.rev, 0);
+  }
+  gl.viewport(0, 0, w, h); gl.disable(gl.DEPTH_TEST); gl.enable(gl.BLEND);
+  gl.useProgram(progWbAccum);
+  gl.uniformMatrix4fv(gl.getUniformLocation(progWbAccum, 'uMV'), false, MV); setFaceUniforms(progWbAccum);
+  gl.uniformMatrix4fv(gl.getUniformLocation(progWbAccum, 'uP'), false, Pm);
+  gl.uniform1f(gl.getUniformLocation(progWbAccum, 'uAlpha'), opacity);
+  gl.bindVertexArray(geo.vao);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, wb.fbA); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.blendFunc(gl.ONE, gl.ONE); gl.uniform1i(gl.getUniformLocation(progWbAccum, 'uPass'), 0);
+  gl.drawArrays(gl.TRIANGLES, 0, geo.count);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, wb.fbR); gl.clearColor(1, 1, 1, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.blendFunc(gl.ZERO, gl.ONE_MINUS_SRC_COLOR); gl.uniform1i(gl.getUniformLocation(progWbAccum, 'uPass'), 1);
+  gl.drawArrays(gl.TRIANGLES, 0, geo.count);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.clearColor(bg[0], bg[1], bg[2], 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.useProgram(progWbResolve);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, wb.acc); gl.uniform1i(gl.getUniformLocation(progWbResolve, 'uAcc'), 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, wb.rev); gl.uniform1i(gl.getUniformLocation(progWbResolve, 'uRev'), 1);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.disable(gl.BLEND); gl.enable(gl.DEPTH_TEST);
+}
+
+// seams are exact (per triangle) on the polyhedron and blend to smooth over the first stage
+function setFaceUniforms(prog) {
+  const t1 = Math.max(1, mesh.stages[0].to), x = Math.min(1, t / t1);
+  // with seams built into the geometry, colours are exactly per triangle (faithful face topology)
+  const seam = 0;   // one colour per triangle: boundaries are exactly triangle edges
+  gl.uniform1f(gl.getUniformLocation(prog, 'uSeam'), seam);
+  gl.uniform3fv(gl.getUniformLocation(prog, 'uPal'), new Float32Array(COLORS.flatMap(hex)));
+  gl.uniform1fv(gl.getUniformLocation(prog, 'uVis'), new Float32Array(geo.visible.map(v => v ? 1 : 0)));
+  gl.uniform1f(gl.getUniformLocation(prog, 'uWire'), showMesh ? 1 : 0);
+}
+
+function draw() {
+  const w = canvas.width, h = canvas.height;
+  const bg = bgColor();
+  const S = 1 / 380, M = new Float32Array([S,0,0,0, 0,S,0,0, 0,0,S,0, 0,0,0,1]);
+  const MV = mul(new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,-view.dist,1]), mul(view.rot, M));
+  const Pm = perspective(0.7, w / h, 0.1, 50);
+  gl.bindVertexArray(geo.vao);
+  gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);
+  if (opacity >= 0.999) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, w, h);
+    gl.clearColor(bg[0], bg[1], bg[2], 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.useProgram(progOpaque);
+    gl.uniformMatrix4fv(gl.getUniformLocation(progOpaque, 'uMV'), false, MV); setFaceUniforms(progOpaque);
+    gl.uniformMatrix4fv(gl.getUniformLocation(progOpaque, 'uP'), false, Pm);
+    gl.drawArrays(gl.TRIANGLES, 0, geo.count);
+    return;
+  }
+  if (TRANSPARENCY === 'peel') return drawPeel(MV, Pm, bg, w, h);
+  if (TRANSPARENCY === 'wboit') return drawWboit(MV, Pm, bg, w, h);
+  // transparency: triangles sorted back to front by view depth each frame, blended in that order. No depth-buffer
+  // tricks, so it behaves the same on every GPU/driver (the triangles are small and evenly shaped, so ordering by
+  // centroid is accurate).
+  const n = geo.count / 3;
+  if (!geo.order || geo.order.length < n) { geo.order = new Uint32Array(geo.nt); geo.keys = new Float32Array(geo.nt);
+    geo.idx = new Uint32Array(geo.nt * 3); geo.ibo = gl.createBuffer(); }
+  const P = geo.pos, K = geo.keys, O = geo.order;
+  // Sort key: view depth of the centroid, nudged by facing. Along a line of sight into a solid you enter through a
+  // triangle facing the camera and leave through one facing away, so among near-ties (thin plates, where front and
+  // back faces are closer than a triangle's size) facing-away triangles go slightly farther, facing ones nearer. The
+  // nudge is half the triangle's own depth extent, capped at 1 model unit, so separate plates are not reordered.
+  const cap = 1.0 / 380;
+  for (let t = 0; t < n; t++) {
+    const o = 9 * t;
+    const z0 = MV[2] * P[o] + MV[6] * P[o + 1] + MV[10] * P[o + 2] + MV[14];
+    const z1 = MV[2] * P[o + 3] + MV[6] * P[o + 4] + MV[10] * P[o + 5] + MV[14];
+    const z2 = MV[2] * P[o + 6] + MV[6] * P[o + 7] + MV[10] * P[o + 8] + MV[14];
+    // view-space position of the centroid and the triangle normal (for facing)
+    const cx = (P[o] + P[o + 3] + P[o + 6]) / 3, cy = (P[o + 1] + P[o + 4] + P[o + 7]) / 3, cz = (P[o + 2] + P[o + 5] + P[o + 8]) / 3;
+    const vx = MV[0] * cx + MV[4] * cy + MV[8] * cz + MV[12], vy = MV[1] * cx + MV[5] * cy + MV[9] * cz + MV[13], vz = (z0 + z1 + z2) / 3;
+    const ux = P[o + 3] - P[o], uy = P[o + 4] - P[o + 1], uz = P[o + 5] - P[o + 2], wx = P[o + 6] - P[o], wy = P[o + 7] - P[o + 1], wz = P[o + 8] - P[o + 2];
+    const nx = uy * wz - uz * wy, ny = uz * wx - ux * wz, nz = ux * wy - uy * wx;
+    const nvx = MV[0] * nx + MV[4] * ny + MV[8] * nz, nvy = MV[1] * nx + MV[5] * ny + MV[9] * nz, nvz = MV[2] * nx + MV[6] * ny + MV[10] * nz;
+    const away = nvx * vx + nvy * vy + nvz * vz > 0;                  // normal points away from the eye
+    const bias = Math.min(0.5 * (Math.max(z0, z1, z2) - Math.min(z0, z1, z2)), cap);
+    K[t] = vz + (away ? -bias : bias); O[t] = t;                       // more negative = farther = drawn first
+  }
+  const sub = O.subarray(0, n); sub.sort((a, b) => K[a] - K[b]);
+  for (let q = 0; q < n; q++) { const t = sub[q]; geo.idx[3 * q] = 3 * t; geo.idx[3 * q + 1] = 3 * t + 1; geo.idx[3 * q + 2] = 3 * t + 2; }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, w, h);
+  gl.clearColor(bg[0], bg[1], bg[2], 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.disable(gl.DEPTH_TEST); gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  gl.useProgram(progPeel);
+  gl.uniformMatrix4fv(gl.getUniformLocation(progPeel, 'uMV'), false, MV); setFaceUniforms(progPeel);
+  gl.uniformMatrix4fv(gl.getUniformLocation(progPeel, 'uP'), false, Pm);
+  gl.uniform1f(gl.getUniformLocation(progPeel, 'uAlpha'), opacity);
+  gl.uniform1i(gl.getUniformLocation(progPeel, 'uFirst'), 1);          // no peeling: every fragment is drawn
+  gl.bindVertexArray(geo.vao);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, geo.ibo);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, geo.idx.subarray(0, 3 * n), gl.STREAM_DRAW);
+  gl.drawElements(gl.TRIANGLES, 3 * n, gl.UNSIGNED_INT, 0);
+  gl.disable(gl.BLEND); gl.enable(gl.DEPTH_TEST);
+}
+
+// ---- UI ----
+const timeEl = document.getElementById('time'), playBtn = document.getElementById('play'), stageEl = document.getElementById('stage');
+function stageName(t) {
+  const s = mesh.stages.find(s => t >= s.from && t <= s.to) || mesh.stages[mesh.stages.length - 1];
+  return s.name;
+}
+// Playback runs in "motion time" u (keyframe intervals last in proportion to how far the surface moves);
+// t is the position in the keyframe sequence.
+let u = 0;
+const uMax = () => mesh.times[mesh.times.length - 1];
+function uToT(v) {
+  const T = mesh.times; let lo = 0, hi = T.length - 1;
+  while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (T[mid] <= v) lo = mid; else hi = mid; }
+  return lo + (T[hi] > T[lo] ? (v - T[lo]) / (T[hi] - T[lo]) : 0);
+}
+function setU(v) { if (!mesh) return; u = Math.max(0, Math.min(uMax(), v)); setT(uToT(u)); timeEl.value = Math.round(u / uMax() * 1000);
+  stageEl.textContent = `${stageName(t)} · ${Math.round(u / uMax() * 100)}%`; }
+function setT(v) { t = Math.max(0, Math.min(mesh.nf - 1, v)); setFrame(t); }
+timeEl.oninput = () => { playing = false; playBtn.textContent = 'Play'; setU(timeEl.value / 1000 * uMax()); };
+playBtn.onclick = () => { if (!mesh) return; if (u >= uMax() - 1e-6) setU(0); playing = !playing; playBtn.textContent = playing ? 'Pause' : 'Play'; };
+document.getElementById('speed').oninput = e => speed = +e.target.value;
+let showMesh = false;
+document.getElementById('mesh').onchange = e => { showMesh = e.target.checked; };
+const opEl = document.getElementById('opacity'), opOut = document.getElementById('opOut');
+opEl.oninput = () => { opacity = +opEl.value; opOut.textContent = Math.round(opacity * 100) + '%'; };
+const legend = document.getElementById('legend');
+const faceBoxes = COLORS.map((c, i) => {
+  const l = document.createElement('label');
+  l.innerHTML = `<input type="checkbox" checked><span style="background:${c}"></span>F${i+1}`;
+  const box = l.querySelector('input');
+  box.onchange = () => { FACE_VISIBLE[i] = box.checked; updateAllBtn(); };
+  legend.appendChild(l);
+  return box;
+});
+// one button: "None" when every face is shown, "All" otherwise
+const allBtn = document.createElement('button');
+allBtn.id = 'allFaces'; allBtn.type = 'button';
+function updateAllBtn() { allBtn.textContent = FACE_VISIBLE.every(v => v) ? 'None' : 'All'; }
+allBtn.onclick = () => {
+  const show = !FACE_VISIBLE.every(v => v);
+  faceBoxes.forEach((b, i) => { b.checked = show; FACE_VISIBLE[i] = show; });
+  updateAllBtn();
+};
+legend.appendChild(allBtn); updateAllBtn();
+
+let dragging = false, last = null, vel = [0, 0], lastMove = 0, rotSteps = 0;
+const ROT_RENORM = 32;   // a drag can run for thousands of steps without ever letting go
+function rotateBy(dx, dy) { const a = Math.hypot(dx, dy) * 0.008; if (a === 0) return;
+  view.rot = mul(axisAngle([dy, dx, 0], a), view.rot);
+  if (++rotSteps >= ROT_RENORM) settleRot(); }
+function settleRot() { orthonormalize(view.rot); rotSteps = 0; }
+canvas.addEventListener('pointerdown', e => { dragging = true; last = [e.clientX, e.clientY]; vel = [0, 0]; canvas.setPointerCapture(e.pointerId); canvas.classList.add('drag'); });
+canvas.addEventListener('pointermove', e => { if (!dragging) return; const dx = e.clientX - last[0], dy = e.clientY - last[1];
+  rotateBy(dx, dy); vel = [dx, dy]; lastMove = performance.now(); last = [e.clientX, e.clientY]; });
+const end = () => { dragging = false; canvas.classList.remove('drag'); if (performance.now() - lastMove > 80) vel = [0, 0]; settleRot(); };
+canvas.addEventListener('pointerup', end); canvas.addEventListener('pointercancel', end);
+canvas.addEventListener('wheel', e => { e.preventDefault(); view.dist = Math.min(10, Math.max(1.2, view.dist * Math.exp(e.deltaY * 0.001))); }, { passive: false });
+
+function resize() { const dpr = window.devicePixelRatio || 1; canvas.width = canvas.clientWidth * dpr; canvas.height = canvas.clientHeight * dpr; }
+window.addEventListener('resize', resize);
+
+const DURATION = 36;   // seconds for the whole animation at speed 1
+function frame(now) {
+  const dt = Math.min(0.1, (now - lastT) / 1000); lastT = now;
+  if (playing) { setU(u + dt * speed * uMax() / DURATION); if (u >= uMax()) { playing = false; playBtn.textContent = 'Play'; } }
+  if (!dragging && (vel[0] || vel[1])) { rotateBy(vel[0], vel[1]); vel = vel.map(v => Math.abs(v * 0.95) < 0.02 ? 0 : v * 0.95);
+    if (!vel[0] && !vel[1]) settleRot(); }
+  draw();
+  requestAnimationFrame(frame);
+}
+
+(async () => {
+  if (!gl) { document.getElementById('loading').textContent = 'WebGL2 is not available in this browser.'; return; }
+  resize(); { const bg = bgColor(); gl.clearColor(bg[0], bg[1], bg[2], 1); gl.clear(gl.COLOR_BUFFER_BIT); }   // page colour while loading
+  // nothing is downloaded until the visitor asks for it (skip with ?autoload=1)
+  const btn = document.getElementById('loadBtn');
+  fetch('morph.bin', { method: 'HEAD' }).then(r => { const n = +r.headers.get('Content-Length');
+    if (n) btn.textContent = `Load animation (${(n / 1e6).toFixed(1)} MB)`; }).catch(() => {});
+  if (!new URLSearchParams(location.search).has('autoload')) await new Promise(res => btn.addEventListener('click', res, { once: true }));
+  btn.remove();
+  document.getElementById('loadText').hidden = false; document.querySelector('#loading .bar').hidden = false;
+  try { mesh = await loadData(); }
+  catch (err) { document.getElementById('loading').textContent = location.protocol === 'file:'
+      ? 'This page loads morph.bin, which browsers block for local files: serve the folder (e.g. python3 -m http.server).'
+      : 'Could not load the animation data: ' + err.message; return; }
+  geo = buildGeometry(mesh);
+  document.getElementById('loading').remove();
+  resize(); setU(0);
+  // URL parameters (handy for screenshots / debugging): ?opacity=0.5&u=0.6&dist=2&rx=0.3&ry=1.2&method=peel|wboit|sort
+  if (PARAMS.has('opacity')) { opEl.value = PARAMS.get('opacity'); opEl.oninput(); }
+  if (PARAMS.has('u')) setU(+PARAMS.get('u') * uMax());
+  if (PARAMS.has('dist')) view.dist = +PARAMS.get('dist');
+  if (PARAMS.has('rx')) view.rot = mul(axisAngle([1, 0, 0], +PARAMS.get('rx')), view.rot);
+  if (PARAMS.has('ry')) view.rot = mul(axisAngle([0, 1, 0], +PARAMS.get('ry')), view.rot);
+  if (PARAMS.has('mesh')) { showMesh = true; document.getElementById('mesh').checked = true; }
+  document.title = 'Genus-3 Morph [' + TRANSPARENCY + ', exact=' + EXACT_DEPTH + ']';
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
