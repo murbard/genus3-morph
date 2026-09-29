@@ -35,6 +35,7 @@ then open <http://127.0.0.1:8000/>. Needs WebGL2. Nothing downloads until you pr
 | `morph_loader.js` | Parses `morph.bin` and replays the remeshing; tested bit-exact against the packager. |
 | `morph.bin` | Animation data — keyframes plus the edge collapses and splits needed to replay each remesh round. |
 | `polyhedron.html` | The flat polyhedron on its own, no animation, with CPU-sorted transparency. |
+| `pipeline/` | The simulation and packaging code that generates `morph.bin`, and the polyhedron's coordinates. |
 
 ## Controls
 
@@ -60,10 +61,11 @@ On some ANGLE-on-NVIDIA configurations the depth-peeling path renders concentric
 while the same browser and driver are fine with `?method=sort`. Because the banding survives comparing exact float
 depth copies and rejecting the same triangle by id, plain depth precision does not explain it. Not diagnosed.
 
-## What is not here
+## Generating the data
 
-The simulation and packaging pipeline that produces `morph.bin` is not included; this repository is the viewer and
-the data it replays.
+`pipeline/` holds the code that produces `morph.bin` from the polyhedron's integer coordinates, including
+`pipeline/poly.json` — the 24 vertices and 8 faces themselves. It is research code run stage by stage rather than a
+one-command build; see [pipeline/README.md](pipeline/README.md).
 
 ## See also
 
